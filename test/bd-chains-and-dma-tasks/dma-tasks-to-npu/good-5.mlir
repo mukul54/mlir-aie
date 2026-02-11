@@ -22,13 +22,13 @@ module {
     // CHECK: %{{.*}} = aie.buffer(%{{.*}}tile_0_1) {address = [[ADDR2:[0-9]+]] {{.*}}}
     %buf1 = aie.buffer(%tile_0_1) : memref<32xi8>
 
-    aiex.runtime_sequence(%arg0: memref<32xi8>) {
+    aie.runtime_sequence(%arg0: memref<32xi8>) {
       %t1 = aiex.dma_configure_task(%tile_0_1, MM2S, 0) {
-          // CHECK: aiex.npu.write32 {address = 1703940 : ui32, value = [[ADDR1]] : ui32}
+          // CHECK: {address = 1703940 : ui32, mask = 524287 : ui32, value = 1 : ui32}
           aie.dma_bd(%buf0 : memref<32xi8>, 4, 16) {bd_id = 0 : i32}
           aie.next_bd ^bd2
         ^bd2:
-          // CHECK: aiex.npu.write32 {address = 1703972 : ui32, value = [[ADDR2]] : ui32}
+          // CHECK: aiex.npu.maskwrite32 {address = 1703972 : ui32, mask = 524287 : ui32, value = 16385 : ui32}
           aie.dma_bd(%buf1 : memref<32xi8>, 4, 16) {bd_id = 1 : i32}
           aie.end
       }
