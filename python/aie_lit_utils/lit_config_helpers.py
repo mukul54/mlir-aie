@@ -218,6 +218,14 @@ class LitConfigHelper:
         config.found = True
         config.flags = f"-I{xrt_include_dir} -L{xrt_lib_dir} -luuid -lxrt_coreutil"
         config.substitutions["%xrt_flags"] = config.flags
+        # Add XRT library directory to LD_LIBRARY_PATH for runtime linking,
+        # preserving any existing entries from the parent environment.
+        existing_ld_library_path = os.environ.get("LD_LIBRARY_PATH")
+        if existing_ld_library_path:
+            new_ld_library_path = existing_ld_library_path + os.pathsep + xrt_lib_dir
+        else:
+            new_ld_library_path = xrt_lib_dir
+        config.environment["LD_LIBRARY_PATH"] = new_ld_library_path
 
         # Detect NPU hardware
         try:
@@ -234,7 +242,7 @@ class LitConfigHelper:
             # Old: "|[0000:41:00.1]  ||RyzenAI-npu1  |"
             # New: "|[0000:41:00.1]  |NPU Phoenix  |"
             pattern = re.compile(
-                r"[\|]?(\[.+:.+:.+\]).+\|(RyzenAI-(npu\d)|NPU (\w+))\W*\|"
+                r"[\|]?(\[.+:.+:.+\]).+\|(RyzenAI-(npu\d)|NPU ([\w ]+?))\s*\|"
             )
 
             for line in output:

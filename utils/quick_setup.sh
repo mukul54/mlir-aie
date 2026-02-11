@@ -59,7 +59,7 @@ $my_python -m venv ironenv
 source ironenv/bin/activate
 python3 -m pip install --upgrade pip
 
-python3 -m pip install mlir_aie -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-2/ 
+python3 -m pip install mlir_aie -f https://github.com/Xilinx/mlir-aie/releases/expanded_assets/latest-wheels-3/ 
 export MLIR_AIE_INSTALL_DIR="$(pip show mlir_aie | grep ^Location: | awk '{print $2}')/mlir_aie"
 
 # TODO: Use nightly latest llvm-aie once it is fixed
@@ -71,9 +71,7 @@ pip install pre-commit
 # This installs the pre-commit hooks defined in .pre-commit-config.yaml
 pre-commit install
 
-HOST_MLIR_PYTHON_PACKAGE_PREFIX=aie python3 -m pip install -r python/requirements_extras.txt
 python3 -m pip install -r python/requirements_ml.txt
-
 python3 -m pip install -r python/requirements_notebook.txt
 
 # This creates an ipykernel (for use in notebooks) using the ironenv venv
