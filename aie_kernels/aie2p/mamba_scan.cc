@@ -119,6 +119,66 @@ void mamba_scan_vector_bf16(
 }
 
 //==============================================================================
+// Mamba Selective Scan - INTERLEAVED multi-channel (BFloat16)
+//==============================================================================
+// The single-channel scan above is latency-bound: state[t] depends on state[t-1],
+// so the vector unit stalls on the exp->mul->add chain each timestep. Here the
+// CHANNEL loop is INNERMOST: at a fixed timestep t, the n_ch channels are mutually
+// independent, so the compiler software-pipelines across channels and hides the
+// per-channel recurrence latency -> near-peak utilization instead of ~0.05 GOPS.
+// B[t]/C[t] are shared across channels (loaded once per t). Layouts (channel-major):
+//   x,dt: [n_ch, seq_len]   A,state: [n_ch, 16]   B,C: [seq_len, 16]   D: [n_ch]
+//   out:  [n_ch, seq_len]
+//==============================================================================
+void mamba_scan_multi_vector_bf16(
+    const bfloat16* restrict x,
+    const bfloat16* restrict dt,
+    const bfloat16* restrict A,
+    const bfloat16* restrict B,
+    const bfloat16* restrict C,
+    const bfloat16* restrict D,
+    bfloat16* restrict state,
+    bfloat16* restrict out,
+    const int32_t seq_len,
+    const int32_t n_ch
+) {
+    event0();
+    constexpr int VEC = 16;
+    using Vec = aie::vector<bfloat16, VEC>;
+
+    for (int32_t t = 0; t < seq_len; t++) {
+        Vec B_vec = aie::load_v<VEC>((bfloat16*)B + t * VEC);   // shared across channels
+        Vec C_vec = aie::load_v<VEC>((bfloat16*)C + t * VEC);
+
+        // Independent across ch at fixed t -> software-pipelined, hides latency
+        for (int32_t ch = 0; ch < n_ch; ch++) {
+            bfloat16 x_t  = x[ch * seq_len + t];
+            bfloat16 dt_t = dt[ch * seq_len + t];
+            Vec A_vec     = aie::load_v<VEC>((bfloat16*)A + ch * VEC);
+            Vec state_vec = aie::load_v<VEC>((bfloat16*)state + ch * VEC);
+
+            Vec dt_vec = aie::broadcast<bfloat16, VEC>(dt_t);
+            Vec dt_A   = aie::mul(dt_vec, A_vec);
+            v16accfloat exp_acc = getExpBf16(dt_A);
+            Vec exp_vec = to_v16bfloat16(exp_acc);
+
+            aie::accum<accfloat, VEC> state_acc = aie::mul(state_vec, exp_vec);
+            Vec x_vec   = aie::broadcast<bfloat16, VEC>(x_t);
+            Vec x_dt    = aie::mul(x_vec, dt_vec);
+            Vec B_x_dt  = aie::mul(B_vec, x_dt);
+            state_acc   = aie::add(state_acc, B_x_dt);
+            state_vec   = state_acc.to_vector<bfloat16>();
+            aie::store_v((bfloat16*)state + ch * VEC, state_vec);
+
+            Vec y_contrib = aie::mul(state_vec, C_vec);
+            bfloat16 y_sum = aie::reduce_add(y_contrib);
+            out[ch * seq_len + t] = y_sum + bfloat16(float(D[ch]) * float(x_t));
+        }
+    }
+    event1();
+}
+
+//==============================================================================
 // Wrapper Functions (exported to MLIR)
 //==============================================================================
 
@@ -149,6 +209,27 @@ void mamba_scan_bf16(
     bfloat16* C = B_C + (seq_len * d_state);        // C is after B
 
     mamba_scan_vector_bf16(x, dt, A, B, C, D, state, out, seq_len, d_state);
+}
+
+// Interleaved multi-channel wrapper. params (channel-major):
+//   [x: n_ch*seq, dt: n_ch*seq, A: n_ch*d_state, D: n_ch, pad]
+// B_C: [B: seq*d_state, C: seq*d_state] (shared). state: [n_ch*d_state]. out: [n_ch*seq].
+void mamba_scan_multi_bf16(
+    bfloat16* params,
+    bfloat16* B_C,
+    bfloat16* state,
+    bfloat16* out,
+    int32_t seq_len,
+    int32_t d_state,
+    int32_t n_ch
+) {
+    bfloat16* x  = params;
+    bfloat16* dt = params + n_ch * seq_len;
+    bfloat16* A  = params + 2 * n_ch * seq_len;
+    bfloat16* D  = params + 2 * n_ch * seq_len + n_ch * d_state;
+    bfloat16* B  = B_C;
+    bfloat16* C  = B_C + (seq_len * d_state);
+    mamba_scan_multi_vector_bf16(x, dt, A, B, C, D, state, out, seq_len, n_ch);
 }
 
 // Zero initialization helper

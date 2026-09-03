@@ -20,7 +20,8 @@ n_aie_cols?=8
 n_aie_rows=4
 n_channels=$(shell echo $$(($(n_aie_cols) * $(n_aie_rows))))
 
-aieargs+=--dev $(dev) --seq_len $(seq_len) --d_state $(d_state) --dtype $(dtype) --n-aie-cols $(n_aie_cols)
+cpt?=1
+aieargs+=--dev $(dev) --seq_len $(seq_len) --d_state $(d_state) --dtype $(dtype) --n-aie-cols $(n_aie_cols) --channels-per-tile $(cpt)
 
 KERNEL_DEFINES=-DDTYPE=$(dtype)
 
@@ -46,7 +47,7 @@ else
     runtime_dir=${aie2_runtime_dir}
 endif
 
-target_suffix?=${seq_len}_${d_state}_${dtype}_${n_aie_cols}c
+target_suffix?=${seq_len}_${d_state}_${dtype}_${n_aie_cols}c_${cpt}cpt
 mlir_target?=build/aie_${target_suffix}.mlir
 xclbin_target?=build/final_${target_suffix}.xclbin
 insts_target?=build/insts_${target_suffix}.txt

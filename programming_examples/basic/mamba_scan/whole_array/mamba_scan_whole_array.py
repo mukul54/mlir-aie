@@ -36,7 +36,7 @@ import sys
 from aie.extras.context import mlir_mod_ctx
 from aie.dialects.aie import *
 from aie.dialects.aiex import *
-from aie.helpers.dialects.ext.scf import _for as range_
+from aie.iron.controlflow import range_
 from aie.iron.dtype import str_to_dtype
 
 
@@ -64,6 +64,12 @@ def main():
         default=8,
         help="Number of AIE columns to use",
     )
+    argparser.add_argument(
+        "--channels-per-tile",
+        type=int,
+        default=1,
+        help="Channels processed per compute tile (interleaved to hide scan latency)",
+    )
     args = argparser.parse_args()
 
     mamba_scan_whole_array(
@@ -72,14 +78,18 @@ def main():
         args.d_state,
         args.dtype,
         args.n_aie_cols,
+        args.channels_per_tile,
     )
 
 
-def mamba_scan_whole_array(dev, seq_len, d_state, dtype_str, n_aie_cols):
-    """Generate MLIR for whole-array Mamba selective scan"""
+def mamba_scan_whole_array(dev, seq_len, d_state, dtype_str, n_aie_cols, cpt=1):
+    """Generate MLIR for whole-array Mamba selective scan.
+    cpt = channels per compute tile; the kernel interleaves them so independent
+    channels pipeline and hide the per-channel recurrence latency."""
 
     n_aie_rows = 4
-    n_channels = n_aie_cols * n_aie_rows
+    n_cores = n_aie_cols * n_aie_rows
+    n_channels = n_cores * cpt          # cpt channels interleaved per compute tile
 
     # Validate parameters
     assert seq_len > 0, "seq_len must be positive"
@@ -93,19 +103,16 @@ def mamba_scan_whole_array(dev, seq_len, d_state, dtype_str, n_aie_cols):
 
     dtype = str_to_dtype(dtype_str)
 
-    # Per-channel buffer sizes (same as single-core)
-    x_sz = seq_len
-    dt_sz = seq_len
-    A_sz = d_state
-    D_sz = 2  # D + padding for 32-bit DMA alignment
-
-    params_per_channel = x_sz + dt_sz + A_sz + D_sz
+    # Per-CORE buffer sizes (cpt channels, channel-major to match mamba_scan_multi_bf16:
+    #   [x: cpt*seq, dt: cpt*seq, A: cpt*d_state, D: cpt, pad])
+    _base = 2 * cpt * seq_len + cpt * d_state + cpt
+    params_per_channel = _base + ((4 - _base % 4) % 4)   # per-core block, pad to mult of 4
 
     B_sz = seq_len * d_state
     C_sz = seq_len * d_state
     B_C_sz = B_sz + C_sz
 
-    out_per_channel = seq_len
+    out_per_channel = cpt * seq_len     # cpt channels' outputs per core
 
     # Packed sizes for L2 (one column = n_aie_rows channels)
     params_per_col = n_aie_rows * params_per_channel
@@ -132,10 +139,10 @@ def mamba_scan_whole_array(dev, seq_len, d_state, dtype_str, n_aie_cols):
             # Buffer types
             # ============================================================
 
-            # L1 types (per-core, single channel)
+            # L1 types (per-core, cpt channels interleaved)
             params_l1_ty = np.ndarray[(params_per_channel,), np.dtype[dtype]]
             BC_ty = np.ndarray[(B_C_sz,), np.dtype[dtype]]
-            state_ty = np.ndarray[(d_state,), np.dtype[dtype]]
+            state_ty = np.ndarray[(cpt * d_state,), np.dtype[dtype]]
             out_l1_ty = np.ndarray[(out_per_channel,), np.dtype[dtype]]
 
             # L2 types (per-column, packed for all rows)
@@ -150,14 +157,15 @@ def mamba_scan_whole_array(dev, seq_len, d_state, dtype_str, n_aie_cols):
                 f"zero_{dtype_str}", inputs=[state_ty, T.i32()]
             )
             mamba_scan_func = external_func(
-                f"mamba_scan_{dtype_str}",
+                f"mamba_scan_multi_{dtype_str}",
                 inputs=[
-                    params_l1_ty,  # x+dt+A+D combined
-                    BC_ty,         # B+C combined
-                    state_ty,      # state (in/out)
-                    out_l1_ty,     # output
+                    params_l1_ty,  # [x,dt,A,D] for cpt channels (channel-major)
+                    BC_ty,         # B+C combined (shared across channels)
+                    state_ty,      # state (in/out) for cpt channels
+                    out_l1_ty,     # output for cpt channels
                     T.i32(),       # seq_len
                     T.i32(),       # d_state
+                    T.i32(),       # n_ch (channels per tile)
                 ],
             )
 
@@ -290,7 +298,7 @@ def mamba_scan_whole_array(dev, seq_len, d_state, dtype_str, n_aie_cols):
                         tile=core_tiles[row][col],
                         datatype=state_ty,
                         name=f"state_{col}_{row}",
-                        initial_value=np.zeros(d_state, dtype=dtype),
+                        initial_value=np.zeros(cpt * d_state, dtype=dtype),
                     )
 
             # ============================================================
@@ -316,8 +324,8 @@ def mamba_scan_whole_array(dev, seq_len, d_state, dtype_str, n_aie_cols):
                                 ObjectFifoPort.Produce, 1
                             )
 
-                            # Zero state and run selective scan
-                            zero_func(state_buffers[row][col], d_state)
+                            # Zero state and run interleaved multi-channel scan
+                            zero_func(state_buffers[row][col], cpt * d_state)
                             mamba_scan_func(
                                 elem_params,
                                 elem_BC,
@@ -325,6 +333,7 @@ def mamba_scan_whole_array(dev, seq_len, d_state, dtype_str, n_aie_cols):
                                 elem_out,
                                 seq_len,
                                 d_state,
+                                cpt,
                             )
 
                             # Release buffers
@@ -344,11 +353,11 @@ def mamba_scan_whole_array(dev, seq_len, d_state, dtype_str, n_aie_cols):
 
             @runtime_sequence(
                 np.ndarray[
-                    (n_channels * params_per_channel,), np.dtype[dtype]
+                    (n_cores * params_per_channel,), np.dtype[dtype]
                 ],
                 np.ndarray[(B_C_sz,), np.dtype[dtype]],
                 np.ndarray[
-                    (n_channels * out_per_channel,), np.dtype[dtype]
+                    (n_cores * out_per_channel,), np.dtype[dtype]
                 ],
             )
             def sequence(all_params, B_C, all_out):
