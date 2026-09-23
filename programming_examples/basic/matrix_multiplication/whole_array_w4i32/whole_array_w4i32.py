@@ -431,6 +431,12 @@ def my_matmul(
             # We only transfer 4 rows of tiles at once before starting a new transfer block.
             # tb = transfer block; block of transfers before sync call
             tb_max_n_rows = 4 if not c_col_maj else 2
+            # w4i32: with an int32 C the row-of-tiles stride m*n_aie_rows*N (in 32-bit words)
+            # exceeds the 1M-word npu_dma_memcpy_nd limit for large N. Keep every C transfer
+            # to a single tile row (sizes[0] == 1, stride unused) by halving the transfer block:
+            # identical dataflow to the M=256 case, repeated with the existing sync per block.
+            if not c_col_maj and m * n_aie_rows * N > 1048576:
+                tb_max_n_rows = 2
             for tb in range(ceildiv(M // m // n_aie_rows, tb_max_n_rows)):
                 for pingpong in [0, 1]:
                     M // m // n_aie_rows // tb_max_n_rows
